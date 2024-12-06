@@ -1,0 +1,11 @@
+A. Azure CLI:
+    1. To check if a resource provider was registered (after you click on register for a resource provider, it may not reflect that the provider has been registered or not on the UI despite being registered, 
+    work around this delay by checking the status using the following command) or not for the vmss or anything while saving scaling policy: 
+        $az provider show --namespace microsoft.insights -o table
+    2. To connect to a linux VM instance using AZ CLI (PuTTY is an alternative):
+        $az ssh vm --resource-group rg-readit-app --vm-name weather-vm --subscription e850c46c-48ef-4718-b01a-ad2bexamplesub
+    3. Az CLI command to build a DockerImage from a DockerFile and upload to ACR:
+        $az acr build --image <NAME>>:<TAG> --registry <REGISTRY NAME> --file Dockerfile .
+B. .NET SDK:
+    1. Package and publish current project folder and store it in a folder called 'published': 
+        $dotnet publish -o published
