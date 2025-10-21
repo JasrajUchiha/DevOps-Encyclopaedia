@@ -9,3 +9,47 @@ A. Azure CLI:
 B. .NET SDK:
     1. Package and publish current project folder and store it in a folder called 'published': 
         $dotnet publish -o published
+C. Kubernetes:
+    1. Start a cluster on a VM locally:
+        $minikube start
+    2. Kubernetes Dashboard equivalent to rancher UI. (Run in a new terminal):
+        $minikube dashboard
+    3. Run a test container image that includes a webserver:
+        $kubectl create deployment hello-node --image=registry.k8s.io/e2e-test-images/agnhost:2.39 -- /agnhost netexec --http-port=8080
+    4. View deployments (default namespace is default):
+        $kubectl get deployments -n namespaceName
+    5. View pods:
+        $kubectl get pods -n namespaceName
+    6. View Cluster events:
+        $kubectl get events
+    7. View the kubectl configuration:
+        $kubectl config view
+    8. Expose the Pod to the public internet using the kubectl expose command(doesnt get exposed to public internet if running cluster on local):
+        $kubectl expose deployment hello-node --type=LoadBalancer --port=8080
+    9. Know the ip of your minikube cluster(useful for knowing whether local cluster IP is exposed to the internet or not):
+        $minikube ip
+    10. Open a browser window that serves your app attached to a service (only exposed on local network because minikube)
+        $minikube service hello-node
+    11. List currently supported minikube addons:
+        $minikube addons list
+    12. Enable/Disable an addon:
+        $minikube addons [enable/disable] metrics-server
+    13. View the Pod and Service you created by installing that addon:
+        $kubectl get pod,svc -n kube-system
+    14. Display resource (CPU/memory) usage of pods.
+        $kubectl top pod
+        # Show metrics for all pods in the default namespace
+        kubectl top pod
+        
+        # Show metrics for all pods in the given namespace
+        kubectl top pod --namespace=NAMESPACE
+        
+        # Show metrics for a given pod and its containers
+        kubectl top pod POD_NAME --containers
+        
+        # Show metrics for the pods defined by label name=myLabel
+        kubectl top pod -l name=myLabel
+    15. Forward Ports to access a service locally:
+        $kubectl port-forward service/SERVICE_NAME 7080:8080
+    16. Start a tunnel in minikube:
+        $minikube tunnel
