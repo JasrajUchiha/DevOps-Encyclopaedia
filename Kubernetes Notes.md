@@ -4,6 +4,19 @@ Kubernetes coordinates a highly available cluster of computers that are connecte
 
 ---
 
+## Table of Contents
+
+- [Cluster Architecture](#cluster-architecture)
+- [Dashboard](#dashboard)
+- [Pods & Deployments](#pods--deployments)
+- [Multi-Container Pods](#multi-container-pods)
+- [Commands & Arguments](#commands--arguments)
+- [Environment Variables](#environment-variables)
+- [Services](#services)
+- [Namespaces](#namespaces)
+
+---
+
 ## Cluster Architecture
 
 A Kubernetes cluster consists of two types of resources:
@@ -28,7 +41,7 @@ A node is a VM or a physical computer that serves as a worker machine in a Kuber
 
 Node-level components (such as the kubelet) communicate with the control plane using the **Kubernetes API**.
 
-> **Hack:** End users can also use the Kubernetes API directly to interact with the cluster.
+> **Hack:** End users can also use the Kubernetes API directly to interact with the cluster (via `kubectl`, client libraries, or REST calls).
 
 ---
 
@@ -42,21 +55,145 @@ To stop the proxy, press **Ctrl+C** to exit the process. After the command exits
 
 ## Pods & Deployments
 
-A **Kubernetes Pod** is a group of one or more containers, tied together for the purposes of administration and networking. The Pod in this tutorial has only one container.
+A **Kubernetes Pod** is a group of one or more containers, tied together for the purposes of administration and networking. Containers in the same Pod share:
 
-A **Kubernetes Deployment** checks on the health of your Pod and restarts the Pod's container if it terminates. Deployments are the recommended way to manage the creation and scaling of Pods.
+- The same network namespace (they can talk to each other via `localhost`)
+- The same storage volumes (optional)
+- The same lifecycle (they are scheduled and destroyed together)
 
-> **Important:** The cluster itself has a manifest too! View it using the config.
+A **Kubernetes Deployment** is a higher-level controller that manages Pods. It:
 
-Imperative:
+- Maintains the desired number of Pod replicas
+- Checks Pod health and restarts containers if they crash
+- Enables rolling updates and rollbacks
+
+Deployments are the recommended way to manage the creation and scaling of Pods — you rarely create bare Pods directly in production.
+
+> **Important:** The cluster itself has a manifest too. View it with:
+>
+> ```bash
+> kubectl config view
+> ```
+>
+> This shows your kubeconfig — cluster endpoints, credentials, and context — not the in-cluster resources, but how *your machine* connects to the cluster.
+
+### Imperative vs Declarative
+
+| Approach | Description | Example |
+|----------|-------------|---------|
+| **Imperative** | You tell Kubernetes *what to do* via commands | `kubectl create deployment ...` |
+| **Declarative** | You define *desired state* in YAML and apply it | `kubectl apply -f deployment.yaml` |
+
+**Imperative example — create a deployment without YAML:**
+
+```bash
 kubectl create deployment my-deployment --image=nginx:stable -n my-namespace
+```
 
-Multi Container Pods:
+> Prefer declarative (YAML + `kubectl apply`) in production — it's version-controllable, repeatable, and easier to review.
 
-in a pod you can have more than 1 containers.
-Types of containers:
-Init container:
-idecar/helper container
+---
+
+## Multi-Container Pods
+
+A Pod can run more than one container. All containers in a Pod share the same IP address and can communicate over `localhost`.
+
+### Container Types
+
+| Type | Purpose | Runs When |
+|------|---------|-----------|
+| **Init container** | Runs setup tasks *before* the main app starts (e.g. wait for a DB, download config, run migrations) | Sequentially, one after another, before any app container starts |
+| **Sidecar / helper container** | Runs *alongside* the main app to extend or support it (e.g. log shipping, proxy, monitoring agent) | For the entire lifetime of the Pod, in parallel with the app |
+| **App container** | The main application you are deploying | For the entire lifetime of the Pod |
+
+**Init container example — wait for a service before starting the app:**
+
+```yaml
+spec:
+  initContainers:
+    - name: wait-for-db
+      image: busybox
+      command: ['sh', '-c', 'until nc -z db-service 5432; do sleep 2; done']
+  containers:
+    - name: my-app
+      image: my-app:latest
+```
+
+**Sidecar example — a logging agent alongside your app:**
+
+```yaml
+spec:
+  containers:
+    - name: my-app
+      image: my-app:latest
+    - name: log-shipper
+      image: fluentd:latest
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log
+```
+
+---
+
+## Commands & Arguments
+
+By default, a container runs whatever command is defined in the container image's `ENTRYPOINT` and `CMD`. You can override these in the Pod/Deployment manifest.
+
+| Field | Maps to Docker | Purpose |
+|-------|----------------|---------|
+| `command` | `ENTRYPOINT` | The executable to run |
+| `args` | `CMD` | Arguments passed to the command |
+
+**Example — override the default nginx command:**
+
+```yaml
+spec:
+  containers:
+    - name: nginx
+      image: nginx:stable
+      command: ["nginx"]
+      args: ["-g", "daemon off;"]
+```
+
+> If you only set `args` without `command`, Kubernetes uses the image's default `ENTRYPOINT` and replaces only the `CMD`.
+
+---
+
+## Environment Variables
+
+Environment variables inject configuration into containers at runtime. Define them under `spec.containers[].env` in a Pod or Deployment manifest.
+
+**Direct value:**
+
+```yaml
+spec:
+  containers:
+    - name: my-app
+      image: my-app:latest
+      env:
+        - name: LOG_LEVEL
+          value: "debug"
+        - name: APP_PORT
+          value: "8080"
+```
+
+**From a ConfigMap or Secret (preferred for config and sensitive data):**
+
+```yaml
+env:
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: db-credentials
+        key: url
+  - name: APP_CONFIG
+    valueFrom:
+      configMapKeyRef:
+        name: app-config
+        key: settings.json
+```
+
+> Use **ConfigMaps** for non-sensitive config and **Secrets** for passwords, tokens, and keys. Never hardcode secrets in manifests.
 
 ---
 
@@ -66,26 +203,38 @@ A Kubernetes **Service** assigns a constant virtual IP address and DNS name (via
 
 ### Service Types
 
-| Type | Description |
-|------|-------------|
-| **ClusterIP** | Exposes the service on a cluster-internal IP (default) |
-| **NodePort** | Exposes the service on each node's IP at a static port |
-| **ExternalName** | Maps the service to an external DNS name |
-| **LoadBalancer** | Exposes the service externally using a cloud provider's load balancer |
+| Type | Description | Use Case |
+|------|-------------|----------|
+| **ClusterIP** | Exposes the service on a cluster-internal IP (default) | Internal pod-to-pod communication |
+| **NodePort** | Opens a static port (30000–32767) on every node's IP | Dev/testing, or when no cloud LB is available |
+| **ExternalName** | Maps the service to an external DNS name (CNAME) | Pointing to an external service outside the cluster |
+| **LoadBalancer** | Provisions a cloud provider's external load balancer | Production external traffic in cloud environments |
 
-NodePort vs ClusterIP:
-ClusterIP is the default internal Kubernetes service, providing a stable, internal IP address for pod-to-pod communication within the cluster. NodePort builds directly on ClusterIP by opening a specific, static port on every worker node, allowing external traffic (outside the cluster) to access the application.
-NodePort exposes your service on an allocated port (typically 30000-32767) on every node's IP address. When you define a NodePort, Kubernetes automatically provisions an internal ClusterIP under the hood. It is generally not recommended for production setups because managing direct node IP and port combinations can be risky and inefficient.
+### ClusterIP vs NodePort
 
----
+**ClusterIP** is the default internal Kubernetes service. It provides a stable, internal virtual IP for pod-to-pod communication *within* the cluster. No external access.
 
-A LoadBalancer Service is merely a service POINTING to a loadbalancer. Which means you need to have a LoadBalancer configured for the service to get assigned an IP. When running in a Kind cluster etc, it defaults to a NodePort service.
+**NodePort** builds on ClusterIP by opening a specific, static port on *every* worker node. External traffic hits `<NodeIP>:<NodePort>` and is forwarded to the Service's ClusterIP, which routes to Pods.
 
-To define a service in an Imperative way and create a svc without a yaml, you can use:
+```
+External client → NodeIP:30080 → NodePort → ClusterIP → Pod
+```
+
+> NodePort is generally **not recommended for production** — managing direct node IP + port combinations is risky, ports are limited (30000–32767), and you lose the benefits of a proper load balancer.
+
+### LoadBalancer
+
+A LoadBalancer Service is a Service that *points to* a cloud load balancer — you need an actual LoadBalancer provisioner (e.g. AWS ELB, GCP LB, MetalLB on bare metal). Kubernetes creates the LB and assigns it an external IP, which routes traffic to the Service's ClusterIP.
+
+> In local clusters (Kind, Minikube), LoadBalancer often falls back to NodePort because no cloud LB exists.
+
+**Imperative example — expose a deployment as a Service without YAML:**
+
+```bash
 kubectl expose deployment my-deployment --port=80 --target-port=9376
+```
 
----
-
+This creates a ClusterIP Service named `my-deployment` that routes port 80 to container port 9376.
 
 ### Basic Service Example
 
@@ -107,12 +256,13 @@ This service routes to any pods listening on port **9376** with the `app.kuberne
 
 | Field | Meaning |
 |-------|---------|
-| `targetPort` | Port of the application to route to |
-| `port` | Port on which the service is exposed — clients use this when they don't know the application IP (which often changes) |
+| `selector` | Labels used to find which Pods this Service routes to |
+| `port` | Port the Service listens on — what clients connect to |
+| `targetPort` | Port on the Pod/container to forward traffic to |
 
 ### Named Port References
 
-Port definitions in Pods have names, and you can reference these names in the `targetPort` attribute of a Service:
+Port definitions in Pods can have names, and you can reference those names in a Service's `targetPort`:
 
 ```yaml
 apiVersion: v1
@@ -144,24 +294,51 @@ spec:
         - containerPort: 80
           name: http-web-svc
 ```
-This works even if there is a mixture of Pods in the Service using a single configured name, with the same network protocol available via different port numbers. This offers a lot of flexibility for deploying and evolving your Services. For example, you can change the port numbers that Pods expose in the next version of your backend software, without breaking clients.
 
-
-Namespaces:
-Created for separating deployments logically in different namespaces. Can have different RBAC for each namespace. If not specified, everything is deployed to the 'default' namespace.
-
-all kubernetes control plane components are created in the kube-system namespace. coredns, etcd, kube-apiserver, kube-controller, kube-proxy, kube-scheduler etc.
-
-If you exec inside a pod, you can access other pods on the cluster in other namespaces using their IP without having any service at all.
-
-If you are exposing a deploymetn using a svc internally. You can reach pods in a deployment in another namespace using the fqdn of the service. e.g if your service is called my-service, you can reach this service from within another pod ofc using its IP but also using 
-my-service.namespace-of-my-service.svc.cluster.local
-
-if the two deployments are in the same namespace, they can be reached using the hostname as well as the deployment name. 
-hostname = my-service-name, fqdn = my-service-name.namespace-of-my-service.svc.cluster.local
-
-Imperative:
-kubectl create ns my-namespace
+This works even when Pods in the same Service use different port numbers but share the same port *name* and protocol — useful when evolving backend versions without breaking clients.
 
 ---
 
+## Namespaces
+
+Namespaces provide logical separation of resources within a single cluster. Use them to:
+
+- Isolate teams, environments (dev/staging/prod), or applications
+- Apply different **RBAC** policies per namespace
+- Set resource quotas per namespace
+
+If no namespace is specified, everything is deployed to the **`default`** namespace.
+
+All Kubernetes control plane components live in the **`kube-system`** namespace: CoreDNS, etcd, kube-apiserver, kube-controller-manager, kube-proxy, kube-scheduler, etc.
+
+**Imperative example — create a namespace:**
+
+```bash
+kubectl create ns my-namespace
+```
+
+### Cross-Namespace Communication
+
+**Pod-to-Pod (no Service needed):** If you exec into a Pod, you can reach other Pods anywhere in the cluster by their Pod IP directly — no Service required.
+
+**Pod-to-Service (recommended):** To reach a Service in another namespace, use the **Fully Qualified Domain Name (FQDN)**:
+
+```
+<service-name>.<namespace>.svc.cluster.local
+```
+
+**Example:** Service `my-service` in namespace `backend`:
+
+```
+my-service.backend.svc.cluster.local
+```
+
+**Same namespace — short names work too:**
+
+| Format | Example | When to Use |
+|--------|---------|-------------|
+| Service name | `my-service` | Same namespace |
+| Short DNS | `my-service.backend` | Cross-namespace (within cluster) |
+| FQDN | `my-service.backend.svc.cluster.local` | Cross-namespace (always works) |
+
+> DNS resolution inside the cluster is handled by **CoreDNS**. Any Pod can resolve these names automatically.
