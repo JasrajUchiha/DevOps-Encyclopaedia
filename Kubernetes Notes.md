@@ -14,6 +14,11 @@ Kubernetes coordinates a highly available cluster of computers that are connecte
 - [Environment Variables](#environment-variables)
 - [Services](#services)
 - [Namespaces](#namespaces)
+- [DaemonSets](#daemonsets)
+- [Jobs & CronJobs](#jobs--cronjobs)
+- [Static Pods](#static-pods)
+- [Manual Scheduling](#manual-scheduling)
+- [Labels & Selectors](#labels--selectors)
 
 ---
 
@@ -342,3 +347,338 @@ my-service.backend.svc.cluster.local
 | FQDN | `my-service.backend.svc.cluster.local` | Cross-namespace (always works) |
 
 > DNS resolution inside the cluster is handled by **CoreDNS**. Any Pod can resolve these names automatically.
+
+---
+
+## DaemonSets
+
+A **DaemonSet** is like a ReplicaSet, but instead of running a fixed number of replicas, it ensures **one Pod runs on every (matching) node** in the cluster. When a new node joins, the DaemonSet automatically creates a Pod on it. When a node is removed, those Pods are garbage-collected.
+
+| Controller | Behavior |
+|------------|----------|
+| **ReplicaSet / Deployment** | Runs N replicas — scheduler picks any suitable nodes |
+| **DaemonSet** | Runs exactly 1 Pod *per node* — one copy on every node |
+
+### Common Use Cases
+
+- **Monitoring agents** — e.g. Prometheus node exporter on every node
+- **Logging agents** — e.g. Fluentd collecting logs from every node
+- **Cluster networking** — CNI plugins run as DaemonSets
+- **kube-proxy** — handles Service networking rules on every node
+
+### CNI Plugins (Weave, Flannel, Calico)
+
+These are **Container Network Interface (CNI)** plugins — they provide pod networking in Kubernetes. Each Pod gets its own IP, and Pods on different nodes can communicate. CNI plugins typically run as DaemonSets so every node has the networking agent installed.
+
+| Plugin | Brief |
+|--------|-------|
+| **Flannel** | Simple overlay network; wraps traffic in UDP/VXLAN. Easy to set up, good for basic clusters |
+| **Weave Net** | Overlay network with built-in encryption and DNS. Similar to Flannel with extra features |
+| **Calico** | Uses BGP routing instead of heavy overlay; strong network policies for fine-grained firewall rules. Popular in production |
+
+> All three solve the same core problem: *how do Pods on different nodes talk to each other?* They differ in complexity, performance, and policy features.
+
+### DaemonSet Example
+
+YAML structure is similar to a Deployment — `spec.template` defines the Pod, and `spec.selector` matches it:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd-elasticsearch
+  namespace: kube-system
+  labels:
+    k8s-app: fluentd-logging
+spec:
+  selector:
+    matchLabels:
+      name: fluentd-elasticsearch
+  template:
+    metadata:
+      labels:
+        name: fluentd-elasticsearch
+    spec:
+      tolerations:
+        # Allow running on control plane nodes (remove if CP should stay pod-free)
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: fluentd-elasticsearch
+          image: quay.io/fluentd_elasticsearch/fluentd:v5.0.1
+          resources:
+            limits:
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+```
+
+> **Tolerations** let DaemonSet Pods run on nodes that normally reject workloads (e.g. control plane nodes with a `NoSchedule` taint). Without tolerations, the DaemonSet would skip tainted nodes.
+
+---
+
+## Jobs & CronJobs
+
+### Jobs
+
+A **Job** creates one or more Pods that run until they **complete successfully** — then stop. Unlike Deployments (which keep Pods running forever), Jobs are for one-off or batch tasks.
+
+| Use Case | Example |
+|----------|---------|
+| Database migration | Run schema update once |
+| Data processing | Batch export/import |
+| Backup | Snapshot and upload |
+
+Once all Pods in a Job finish, the Job's status is set to **Complete**. Failed Jobs can be retried based on `backoffLimit`.
+
+### CronJobs
+
+A **CronJob** creates Jobs on a **schedule** — like cron on Linux. Use it for recurring tasks: backups, report generation, cleanup scripts.
+
+**Cron syntax:**
+
+```
+┌───────────── minute (0–59)
+│ ┌───────────── hour (0–23)
+│ │ ┌───────────── day of month (1–31)
+│ │ │ ┌───────────── month (1–12)
+│ │ │ │ ┌───────────── day of week (0–6, Sun=0)
+│ │ │ │ │
+* * * * *
+```
+
+| Field | Range | Example |
+|-------|-------|---------|
+| Minute | 0–59 | `0` = at minute 0 |
+| Hour | 0–23 | `14` = 2 PM |
+| Day of Month | 1–31 | `1` = first of the month |
+| Month | 1–12 | `*` = every month |
+| Day of Week | 0–6 | `0` = Sunday |
+
+**Every nth interval** — use `*/n` in the field:
+
+```bash
+*/18 * * * *    # every 18 minutes
+0 */2 * * *     # every 2 hours (at minute 0)
+0 0 * * 0       # every Sunday at midnight
+```
+
+**CronJob example:**
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: "0 2 * * *"   # daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: backup-tool:latest
+              command: ["/bin/sh", "-c", "pg_dump ..."]
+          restartPolicy: OnFailure
+```
+
+---
+
+## Static Pods
+
+The **kube-scheduler** is a control plane component responsible for assigning Pods to nodes. But the scheduler itself runs as a Pod — so who schedules *the scheduler*?
+
+**Static Pods** solve this bootstrap problem. They are Pods managed **directly by the kubelet** on a specific node, **not** by the Kubernetes scheduler or any controller (Deployment, DaemonSet, etc.).
+
+```
+Manifest file on disk → kubelet reads it → Pod created on that node
+(No scheduler, no API server controller involved)
+```
+
+### How It Works
+
+1. Place a Pod manifest (YAML/JSON) in a directory the kubelet watches — usually `/etc/kubernetes/manifests`
+2. The kubelet detects the file and creates the Pod on **that node only**
+3. The kube-apiserver sees the Pod (kubelet reports it) and creates a **mirror Pod** in `kube-system` for visibility — but the kubelet remains the source of truth
+4. If you delete the mirror Pod via `kubectl`, the kubelet recreates it from the manifest on disk
+
+Control plane components (kube-apiserver, kube-scheduler, kube-controller-manager, etcd) are typically run as static Pods on control plane nodes.
+
+**Find the watched directory:**
+
+```bash
+# On a control plane node — check kubelet config
+ps -ef | grep kubelet
+# Look for --pod-manifest-path or staticPodPath in the config
+```
+
+> **`ps -ef`** lists all running processes in full format. `ps` = process status, `-e` = every process, `-f` = full listing (UID, PID, command, etc.). Use it here to inspect kubelet startup flags and find `--config` or `--pod-manifest-path`.
+
+Common path: `/etc/kubernetes/manifests`
+
+---
+
+## Manual Scheduling
+
+By default, the scheduler picks which node runs a Pod. You can **bypass the scheduler entirely** by setting `nodeName` in the Pod spec:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+spec:
+  nodeName: worker-node-2   # force this Pod onto a specific node
+  containers:
+    - name: nginx
+      image: nginx:stable
+```
+
+| Approach | How | Scheduler Involved? |
+|----------|-----|---------------------|
+| Default | Scheduler picks a node | Yes |
+| `nodeName` | You specify the exact node | No — kubelet on that node starts the Pod directly |
+
+> Because the scheduler is bypassed, the Pod is placed even if the scheduler is down. Downside: no automatic rebalancing — if the node is unavailable, the Pod stays unscheduled until that node returns.
+
+**Alternative — `nodeSelector`:** Soft constraint using labels (scheduler still involved, but only picks nodes matching the label):
+
+```yaml
+spec:
+  nodeSelector:
+    disktype: ssd
+```
+
+---
+
+## Labels & Selectors
+
+**Labels** are key-value pairs attached to Kubernetes objects (Pods, Nodes, Services, etc.). **Selectors** are queries that filter objects by their labels. Together they are the primary mechanism for grouping and connecting resources.
+
+```
+Labels on Pods  ←—— matched by ——→  Selectors on Services/Controllers
+```
+
+### Labels
+
+Attach labels in `metadata.labels`:
+
+```yaml
+metadata:
+  labels:
+    app: nginx
+    env: production
+    tier: frontend
+```
+
+- Arbitrary key-value pairs — you define the schema
+- An object can have many labels
+- Used for organization, filtering, and routing
+
+**Common kubectl label commands:**
+
+```bash
+kubectl get pods --show-labels
+kubectl get pods -l app=nginx              # filter by label
+kubectl get pods -l 'env in (prod,staging)'
+kubectl label pod my-pod version=v2        # add/update a label
+kubectl label pod my-pod env-              # remove label (trailing -)
+```
+
+### Selectors
+
+Selectors tell controllers and Services **which objects they manage or route to**.
+
+**Equality-based** (`matchLabels`) — exact key-value match:
+
+```yaml
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+      tier: frontend
+```
+
+**Set-based** (`matchExpressions`) — richer matching:
+
+```yaml
+spec:
+  selector:
+    matchExpressions:
+      - key: env
+        operator: In
+        values: [production, staging]
+      - key: tier
+        operator: NotIn
+        values: [backend]
+```
+
+### Where Selectors Are Used
+
+| Resource | Selector Purpose |
+|----------|------------------|
+| **Deployment / ReplicaSet** | Finds Pods it should manage (must match Pod template labels) |
+| **Service** | Finds Pods to route traffic to (`spec.selector`) |
+| **DaemonSet** | Finds Pods it owns on each node |
+| **NetworkPolicy** | Filters which Pods a policy applies to |
+
+### Important Rules
+
+1. **Deployment selector must match Pod template labels** — if they diverge, the Deployment won't manage its own Pods
+2. **Service selector must match Pod labels** — otherwise the Service has no endpoints and traffic goes nowhere
+3. **Labels ≠ Selectors on the same object** — labels describe *what an object is*; selectors describe *what other objects it targets*
+4. **Immutable selectors** — on Deployments, the selector cannot be changed after creation (you'd need a new Deployment)
+
+**End-to-end example:**
+
+```yaml
+# Deployment creates Pods with labels app=nginx, tier=frontend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+        tier: frontend
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:stable
+---
+# Service routes to Pods where app=nginx
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-svc
+spec:
+  selector:
+    app: nginx
+  ports:
+    - port: 80
+      targetPort: 80
+```
+
+The Deployment's selector (`app: nginx`) matches its Pod labels. The Service's selector (`app: nginx`) matches the same Pods — so traffic flows: **Client → Service → Pod**.
+
+---
+Taints and Tolerations:
