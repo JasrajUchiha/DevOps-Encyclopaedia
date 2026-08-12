@@ -19,6 +19,8 @@ Kubernetes coordinates a highly available cluster of computers that are connecte
 - [Static Pods](#static-pods)
 - [Manual Scheduling](#manual-scheduling)
 - [Labels & Selectors](#labels--selectors)
+- [Taints & Tolerations](#taints--tolerations)
+- [Node Selection (nodeSelector & nodeAffinity)](#node-selection-nodeselector--nodeaffinity)
 
 ---
 
@@ -681,4 +683,263 @@ spec:
 The Deployment's selector (`app: nginx`) matches its Pod labels. The Service's selector (`app: nginx`) matches the same Pods — so traffic flows: **Client → Service → Pod**.
 
 ---
-Taints and Tolerations:
+
+## Taints & Tolerations
+
+**Taints** and **tolerations** control which Pods are *allowed* to run on a node. Think of them as the opposite of labels/selectors:
+
+```
+Labels/Selectors  →  Pod says "I want nodes like X"     (attraction)
+Taints/Tolerations →  Node says "Keep away unless you tolerate me" (repulsion)
+```
+
+A **taint** is applied to a **node**. A **toleration** is applied to a **Pod**. A Pod can only schedule on a tainted node if it has a matching toleration.
+
+A taint can tell which kind of pods are allowed to be scheduled on the tainted node, but the pod can be scheduled on other nodes too even if it has a toleration on current tainted pod specified (repulsion).
+
+### Taint Structure
+
+```bash
+kubectl taint nodes <node-name> key=value:Effect
+```
+
+| Part | Example | Meaning |
+|------|---------|---------|
+| **key** | `node-role.kubernetes.io/control-plane` | Identifier for the taint |
+| **value** | (optional) `true` | Optional value — must match if specified |
+| **effect** | `NoSchedule` | What happens to Pods without a toleration |
+
+### Taint Effects
+
+| Effect | Behavior | Existing Pods |
+|--------|----------|---------------|
+| **NoSchedule** | New Pods without a toleration are **not scheduled** on this node | Unaffected — keep running |
+| **PreferNoSchedule** | Scheduler **tries to avoid** this node, but may place Pods if no better option | Unaffected |
+| **NoExecute** | New Pods without a toleration are **not scheduled** | Existing Pods **without a toleration are evicted** |
+
+> **NoExecute** is the strictest — it actively kicks off running Pods. Use it for maintenance or decommissioning nodes.
+
+### Toleration Structure
+
+Defined in the Pod spec under `spec.tolerations`:
+
+```yaml
+spec:
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"        # key exists, value ignored
+      effect: "NoSchedule"
+```
+
+| Field | Options | Meaning |
+|-------|---------|---------|
+| `key` | any string | Must match the taint key |
+| `operator` | `Equal`, `Exists` | `Equal` = key + value must match; `Exists` = key alone is enough |
+| `value` | string | Required when `operator: Equal` |
+| `effect` | `NoSchedule`, `PreferNoSchedule`, `NoExecute` | Must match the taint effect |
+| `tolerationSeconds` | integer | Only for `NoExecute` — how long to wait before evicting (default: immediate) |
+
+**`Equal` vs `Exists` examples:**
+
+```yaml
+# Taint on node: dedicated=gpu:NoSchedule
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "gpu"
+    effect: "NoSchedule"
+
+# Taint on node: node-role.kubernetes.io/control-plane:NoSchedule (no value)
+tolerations:
+  - key: "node-role.kubernetes.io/control-plane"
+    operator: "Exists"
+    effect: "NoSchedule"
+```
+
+### Common Scenarios
+
+| Scenario | Taint | Who Tolerates |
+|----------|-------|---------------|
+| **Control plane nodes** | `node-role.kubernetes.io/control-plane:NoSchedule` | System DaemonSets (kube-proxy, CNI, etc.) via `Exists` toleration |
+| **Dedicated GPU nodes** | `dedicated=gpu:NoSchedule` | Only ML/training Pods with matching toleration |
+| **Spot/preemptible instances** | `spot=true:NoSchedule` | Fault-tolerant batch Jobs that can handle sudden eviction |
+| **Node maintenance** | `maintenance=true:NoExecute` | Nothing — all non-tolerating Pods get evicted; drain the node |
+| **Special hardware** | `hardware=ssd:NoSchedule` | Pods that need SSD-backed storage |
+
+**Taint a node (imperative):**
+
+```bash
+kubectl taint nodes worker-1 dedicated=gpu:NoSchedule
+kubectl taint nodes worker-1 dedicated=gpu:NoSchedule-   # remove taint (trailing -)
+```
+
+**Dedicated GPU node example:**
+
+```yaml
+# Node tainted: dedicated=gpu:NoSchedule
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-training
+spec:
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "gpu"
+      effect: "NoSchedule"
+  containers:
+    - name: trainer
+      image: ml-trainer:latest
+```
+
+> A toleration alone does **not** guarantee the Pod lands on that node — it only *permits* scheduling there. Combine with **nodeSelector** or **nodeAffinity** to actively target specific nodes.
+
+---
+
+## Node Selection (nodeSelector & nodeAffinity)
+
+While taints/tolerations control what is *blocked* from a node, **nodeSelector** and **nodeAffinity** control where a Pod *wants* to run — by matching **labels on nodes**.
+
+Nodes have labels just like Pods:
+
+```bash
+kubectl label nodes worker-1 disktype=ssd
+kubectl label nodes worker-2 disktype=hdd
+kubectl label nodes gpu-node-1 accelerator=nvidia-tesla
+kubectl get nodes --show-labels
+```
+
+Built-in node labels (automatically set):
+
+| Label | Example Value |
+|-------|---------------|
+| `kubernetes.io/hostname` | `worker-1` |
+| `node.kubernetes.io/instance-type` | `m5.large` (cloud) |
+| `topology.kubernetes.io/zone` | `us-east-1a` |
+| `node-role.kubernetes.io/control-plane` | (exists on CP nodes) |
+
+### nodeSelector
+
+The simplest form — hard requirement. Pod **only** schedules on nodes where **all** specified labels match. If no node matches, the Pod stays **Pending**.
+
+```yaml
+spec:
+  nodeSelector:
+    disktype: ssd
+    zone: us-east-1a
+```
+
+> Limited to exact `key: value` matches. No "prefer" logic, no operators like `In`/`NotIn`. For anything beyond simple matching, use nodeAffinity.
+
+### nodeAffinity
+
+A richer, more expressive version of nodeSelector. Two types:
+
+| Type | Field | Behavior |
+|------|-------|----------|
+| **Required** | `requiredDuringSchedulingIgnoredDuringExecution` | Hard rule — must match or Pod stays Pending |
+| **Preferred** | `preferredDuringSchedulingIgnoredDuringExecution` | Soft rule — scheduler tries to match, but schedules elsewhere if needed |
+
+**Required nodeAffinity — must run on SSD nodes in zone A:**
+
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: disktype
+                operator: In
+                values: [ssd]
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: [us-east-1a]
+```
+
+**Preferred nodeAffinity — prefer GPU nodes, but allow others:**
+
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: accelerator
+                operator: In
+                values: [nvidia-tesla]
+```
+
+**Affinity operators:**
+
+| Operator | Meaning |
+|----------|---------|
+| `In` | Label value is in the list |
+| `NotIn` | Label value is not in the list |
+| `Exists` | Label key exists (any value) |
+| `DoesNotExist` | Label key does not exist |
+| `Gt` / `Lt` | Greater/less than (for numeric values) |
+
+> **`IgnoredDuringExecution`** means if node labels change *after* the Pod is scheduled, the Pod is **not evicted** — affinity is only checked at scheduling time.
+
+### Combined Example — GPU Workload
+
+A complete Pod targeting GPU nodes that are tainted for dedicated use:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-training
+spec:
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "gpu"
+      effect: "NoSchedule"
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: accelerator
+                operator: In
+                values: [nvidia-tesla]
+  containers:
+    - name: trainer
+      image: ml-trainer:latest
+```
+
+1. **Toleration** — allowed onto tainted GPU nodes
+2. **nodeAffinity** — actively targets nodes with `accelerator=nvidia-tesla`
+
+### Comparison — All Scheduling Mechanisms
+
+| Mechanism | Applied On | Direction | Flexibility | Scheduler Involved? |
+|-----------|-----------|-----------|-------------|---------------------|
+| **nodeName** | Pod spec | Pod → exact node | None — hard pin | No |
+| **nodeSelector** | Pod spec | Pod → nodes with labels | Basic — exact match only | Yes |
+| **nodeAffinity** | Pod spec | Pod → nodes with labels | High — required + preferred, operators | Yes |
+| **Taints** | Node | Node → repels Pods | 3 effects | N/A (node-side) |
+| **Tolerations** | Pod spec | Pod → permits tainted nodes | Must match taint key/effect | Yes |
+
+### Taints/Tolerations vs nodeSelector/nodeAffinity
+
+| | Taints & Tolerations | nodeSelector & nodeAffinity |
+|--|---------------------|----------------------------|
+| **Perspective** | Node-centric — "who can come here?" | Pod-centric — "where do I want to go?" |
+| **Analogy** | Bouncer at a VIP room | Guest requesting a specific table |
+| **Default behavior** | All Pods blocked from tainted node | Pod can run anywhere unless constrained |
+| **Best for** | Protecting special nodes (CP, GPU, maintenance) | Targeting specific hardware/zones/topology |
+| **Used together?** | Yes — commonly combined (see GPU example above) | Yes |
+
+**Decision guide:**
+
+```
+Need to KEEP Pods OFF a node?        → Taint the node
+Need to ALLOW specific Pods ON it?   → Add toleration to those Pods
+Need to ATTRACT Pods TO a node?      → Label the node + use nodeSelector/nodeAffinity
+Need to PIN a Pod to one node?       → Use nodeName (bypasses scheduler)
+```
