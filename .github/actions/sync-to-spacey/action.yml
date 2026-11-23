@@ -1,0 +1,66 @@
+name: 'Sync Markdown Notes to Spacey'
+description: 'Parses Markdown files using two-layer Git commit attribution and syncs day-based sections to Spacey.'
+inputs:
+  api_url:
+    description: 'Spacey Worker API URL'
+    required: true
+  api_key:
+    description: 'Spacey personal API key (sp_live_... or sp_dev_...)'
+    required: true
+  timezone:
+    description: 'IANA timezone for grouping commits by calendar day (e.g. Asia/Kolkata, UTC)'
+    required: false
+    default: 'Asia/Kolkata'
+  paths:
+    description: 'Comma-separated path prefixes to sync'
+    required: false
+    default: 'notes'
+  ignore:
+    description: 'Comma-separated filenames to ignore'
+    required: false
+    default: 'readme.md,contributing.md,license.md'
+  mode:
+    description: 'Attribution mode: auto | full | incremental'
+    required: false
+    default: 'auto'
+  sync_all:
+    description: 'Sync all tracked Markdown files instead of only files changed in the push'
+    required: false
+    default: 'false'
+  dry_run:
+    description: 'Preview sections without sending writes to Spacey'
+    required: false
+    default: 'false'
+  image_base_url:
+    description: 'Optional base URL for rewriting relative Markdown image links'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node 24
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Run Spacey GitHub Sync
+      shell: bash
+      env:
+        SPACEY_API_URL: ${{ inputs.api_url }}
+        SPACEY_API_KEY: ${{ inputs.api_key }}
+        SPACEY_TIMEZONE: ${{ inputs.timezone }}
+        SPACEY_SYNC_ALL: ${{ inputs.sync_all }}
+        SPACEY_DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        ARGS=(
+          "--mode" "${{ inputs.mode }}"
+          "--ignore" "${{ inputs.ignore }}"
+        )
+        if [ -n "${{ inputs.paths }}" ]; then
+          ARGS+=("--paths" "${{ inputs.paths }}")
+        fi
+        if [ -n "${{ inputs.image_base_url }}" ]; then
+          ARGS+=("--image-base-url" "${{ inputs.image_base_url }}")
+        fi
+        node "${{ github.action_path }}/src/syncCli.ts" "${ARGS[@]}"

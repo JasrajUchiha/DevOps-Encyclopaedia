@@ -1,0 +1,49 @@
+name: Sync Notes to Spacey
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'notes/**/*.md'
+  workflow_dispatch:
+    inputs:
+      sync_all:
+        description: 'Sync all Markdown files under notes/'
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Preview attribution without writing to Spacey'
+        type: boolean
+        default: false
+
+jobs:
+  sync-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Spacey API key secret
+        env:
+          SPACEY_API_KEY: ${{ secrets.SPACEY_API_KEY }}
+        run: |
+          if [ -z "$SPACEY_API_KEY" ]; then
+            echo "::error::Missing SPACEY_API_KEY repository secret. Generate a key in Spacey (Settings -> API & GitHub Sync) and add it in Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Checkout full Git history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync Markdown notes to Spacey
+        uses: ./.github/actions/sync-to-spacey
+        with:
+          api_url: ${{ vars.SPACEY_API_URL || 'https://spacey-api.spacey-api-worker.workers.dev' }}
+          api_key: ${{ secrets.SPACEY_API_KEY }}
+          timezone: 'Asia/Kolkata'
+          paths: 'notes'
+          ignore: 'readme.md,contributing.md,license.md'
+          mode: 'auto'
+          sync_all: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sync_all == 'true' }}
+          dry_run: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
+          image_base_url: 'https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}'
